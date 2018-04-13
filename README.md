@@ -153,4 +153,163 @@ To get the password we need just open the file listed in your ssh session:
     sudo cat /var/lib/jenkins/secrets/initialAdminPassword
 ```
 
-The code that pops out will be your password, enter it in the web portal.In the next window, select `Install Recommended Plugins`.
+The code that pops out will be your password, enter it in the web portal.In the next window, select `Install Recommended Plugins`. When prompted, create a user login for yourself. Jenkins is now ready to go! Now we can start on the fun part. 
+
+# Part 4: Configuring Jenkins
+
+## Prework: Create a heroku account and a bot github account
+
+Before we start, go to heroku and make a new account if you dont have one. Even if you have your own github account, I highly recommend creating a "bot" account. This will become the identity for your jenkins machine and will things cleaner in the future. If you expand your team you can feel comfortable passing this account around if needed and it won't be tied to you as a person. 
+
+## Prework: Setup a Github Repo and Heroku Project
+
+First, let's create a new github repository. If you want to save some time, you can just fork the one I used from [here](https://github.com/jmccormack200/AngularJenkins). Its essentially a typical angular starter project with some slight changes that I'll go over as we go through this.
+
+Then log into your Heroku account and create a new heroku app. 
+
+## Creating a PR Builder
+
+We'll start with the PR Builder. Everytime we open a new PR this will:
+  1. Run our tests
+  1. Build the app
+  1. Run prettier to check for formatting issues
+
+  On the main page click on "Create new jobs"
+
+![Jenkins-2.png](images/Jenkins-2.png)
+
+Then give it a name that includes -pr-builder (or something so you can differentiate it from the project builder) and click "Freestyle project" followed by "Ok".
+
+![Jenkins-3.png](images/Jenkins-3.png)
+
+Now we can start configuring the Jenkins project itself. To start, let's give it information about our Git project. Follow along below and change things for your project as needed. The part under Refspec and Branc Specifier allows us to point to whatever PR has just been updated or opened. Under Credentials, you can select the default and it will prompt you for a username and password. This is where you'll give Jenkins the username and password for the bot account you made in the earlier step. You can also use SSH keys or another method to authenticate the account. 
+
+![Jenkins-4.png](images/Jenkins-4.png)
+
+Now, under build triggers see if there's a section for "Github Pull Request Builder", if there is jump down a bit, otherwise follow along. We need to install a new plugin in Jenkins. Hit save at the bottom to save what you've done so far, then jump back to the Jenkins homepage and click `Manage Plugins`.
+
+![Jenkins-5.png](images/Jenkins-5.png)
+
+Then search for "Github" and select the PR Builder. As a warning, there was a security flaw with earlier versions of this plugin, make sure to read the warning if you installed anything older than 1.40.0. At the bottom of the page, click download now and install after restart. You may have to check a box that says "restart now". Jenkins will go offline briefly and when it comes back you'll have the new plugin.
+
+![Jenkins-6.png](images/Jenkins-6.png)
+
+Now if you go under "Build Triggers" you should have an option for "Github pull request builder." Click on it and check that everything looks like the image below. Now a note here is that we're going to just be polling github every 5 minutes to see if there's a change. If we move this VM up to an AWS instance or some other area where its exposed to the world we can use Github webhooks instead. These are a much better solution but to keep things simple (and Free) we're going to just use the Crontab line. 
+
+![Jenkins-7.png](images/Jenkins-7.png)
+
+Now under the build tab let's add an `Execute Shell` Stage:
+
+![Jenkins-8.png](images/Jenkins-8.png)
+
+Now let's add the tasks we want to run:
+
+```Shell
+    npm install
+    ng build
+    ng test
+```
+
+![Jenkins-9.png](images/Jenkins-9.png)
+
+This will build and test our app. If either step fails, the build will fail and then we'll be unable to merge our PR. 
+
+We're going to add a post build step to run prettier and make sure there are no formatting errors. If you aren't using a fork of my repo, open your `package.json` file and add this under scripts:
+
+```Javascript
+    "scripts": {
+        "format": "prettier --single-quote --trailing-comma es5 --write \"{src/app,__{tests,mocks}__}/**/*.ts\""
+    }
+
+```
+
+And also install prettier with:
+```Shell
+    npm install --save-dev prettier
+```
+
+While we're here, I should also mention that Karma defaults to using Chrome, but Fedora comes with Firefox. Let's switch Karma to use firefox. You can always install Chrome later and switch back. First go [here](https://github.com/jmccormack200/AngularJenkins/blob/master/karma.conf.js) and copy my karma config file. This will switch the tests over to using firefox and also allow us to output an xml file that Jenkins can use to display a graph of our code coverage.
+
+## <b>Important:</b>
+We also need to make a slight update to add a server for heroku to use. If you follow this tutorial:  [https://medium.com/@ryanchenkie_40935/angular-cli-deployment-host-your-angular-2-app-on-heroku-3f266f13f352](https://medium.com/@ryanchenkie_40935/angular-cli-deployment-host-your-angular-2-app-on-heroku-3f266f13f352)
+
+Then run:
+```Shell
+    npm install --save-dev karma-firefox-launcher
+    npm install --save-dev karma-junit-reporter
+```
+
+Now under "Post build Actions add a post-build task, if you don't have that option install the plugin the same way we installed the github plugin. 
+
+![Jenkins-10.png](images/Jenkins-10.png)
+
+Now add the following code under the script section of post build tasks:
+
+```Shell
+npm run format
+git diff
+git diff --quiet || \
+echo "Prettier Found Differences, please clean project and try again" || \
+exit 1
+git diff --quiet && \
+exit 0
+```
+
+Basically, this runs the prettier script we created, then checks to see if there's a difference. If there are, it fails the build.
+
+![Jenkins-11.png](images/Jenkins-11.png)
+
+And we're done! Now we can move on to making the Project Builder and deploying to Heroku:
+
+## Creating a Project Builder
+
+The project builder will be really similar to the PR builder but with a few key differences. It will only build when something is merged into master, and it will also upload the final build to our heroku app. 
+
+Before we begin, we need to get our jenkins VM registered with our Heroku app. First download the heroku cli tools [here](https://devcenter.heroku.com/articles/heroku-cli). Then hop back into an ssh session with your user account. Now type:
+
+```Shell
+    sudo su -s /bin/bash jenkins
+    whoami
+```
+
+When you type whoami it should return "jenkins". We've essentially just opened a shell as the jenkins user. Now we can generate a new RSA key, and add it to heroku. 
+
+Then type:
+
+```Shell
+    heroku login
+    ssh-keygen -t rsa -C "your_email@example.com"
+    heroku keys:add
+```
+
+Then copy the key you just added to heroku by either navigating to their web portal or by typing
+
+```Shell
+    sudo cat /var/lib/jenkins/.ssh/id_rsa
+```
+
+We still need to let Jenkins know about this key, we'll do that in a minute. 
+
+Now, create a new project in Jenkins and navigate down to the `Source Code Management` section. We're going to create two "repository" entries, one for Github and one for Heroku. Fill in your information as appropriate.
+
+![Jenkins-12.png](images/Jenkins-12.png)
+
+
+Under the Credentials tab for heroku, click the "Add" and "Jenkins" Button. And enter your heroku username and ssh key that you copied from earlier. 
+
+![Jenkins-13.png](images/Jenkins-13.png)
+
+Our Build Section will be the same as before:
+
+![Jenkins-9.png](images/Jenkins-9.png)
+
+Our post build actions will contain a JuNit Test result Report:
+
+![Jenkins-14.png](images/Jenkins-14.png)
+
+And a Git Publisher to push to Heroku:
+
+![Jenkins-15.png](images/Jenkins-15.png)
+
+And that's it! Now when a build kicks off from master we'll get an update to our test reports and we can see the results on Heroku!!!
+
